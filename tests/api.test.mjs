@@ -1,0 +1,40 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';
+import worker from '../src/worker.js';import {pinHash} from '../src/pin-auth.js';import {drinks} from '../src/data.js';
+async function fixture(){const sql=new DatabaseSync(':memory:');sql.exec('CREATE TABLE records(id TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE progress(id TEXT PRIMARY KEY,correct INTEGER NOT NULL DEFAULT 0,attempts INTEGER NOT NULL DEFAULT 0,due INTEGER NOT NULL DEFAULT 0)');
+ const execute=q=>{const s=sql.prepare(q.sql);return {results:s.columns().length?s.all(...q.args):(s.run(...q.args),[])};};
+ const DB={prepare(sql){return{sql,args:[],bind(...args){this.args=args;return this},async first(){return execute(this).results[0]||null},async all(){return execute(this)},async run(){return execute(this)}}},async batch(queries){sql.exec('BEGIN');try{const r=queries.map(execute);sql.exec('COMMIT');return r}catch(e){sql.exec('ROLLBACK');throw e}}};
+ const salt='12345678901234567890123456789012',hash=await pinHash('2468',salt),files=new Map();
+ const env={DB,PROTOTYPE_PIN_HASH:JSON.stringify({salt,hash}),ASSETS:{fetch:async()=>new Response('assets')},BUCKET:{put:async(k,stream)=>files.set(k,await new Response(stream).text())}};
+ const call=(path,body,cookie='',ip='test',origin='https://test.example')=>worker.fetch(new Request('https://test.example'+path,{method:body===undefined?'GET':'POST',headers:{Origin:origin,Cookie:cookie,'CF-Connecting-IP':ip,...(body instanceof FormData?{}:{'Content-Type':'application/json'})},body:body===undefined?undefined:body instanceof FormData?body:JSON.stringify(body)}),env);
+ const login=await call('/api/login',{pin:'2468'});assert.equal(login.status,200);const cookie=login.headers.get('Set-Cookie').split(';')[0];return{sql,DB,env,call,cookie,files};}
+
+test('PIN, cookies, protected sections, invalid PIN, logout and expiry',async()=>{const f=await fixture();const {call,cookie,sql}=f;
+ for(const path of ['/api/catalog','/api/wikipedia?q=Verjus','/api/draft','/api/publish','/api/training','/api/answer'])assert.equal((await call(path,path.includes('catalog')||path.includes('wikipedia')?undefined:{})).status,401);
+ assert.deepEqual(await(await call('/api/session',undefined,cookie)).json(),{unlocked:true});assert.equal((await call('/api/login',{pin:'0000'})).status,401);assert.equal((await call('/api/login',null)).status,400);
+ const l=await call('/api/login',{pin:'2468'},'','other');for(const s of ['HttpOnly','Secure','SameSite=Strict','Max-Age=604800'])assert(l.headers.get('Set-Cookie').includes(s));
+ assert.equal((await call('/api/logout',{},cookie,'test','https://bad.example')).status,403);
+ assert.equal((await call('/api/logout',{},cookie)).status,200);assert.equal((await call('/api/catalog',undefined,cookie)).status,401);
+ const c=l.headers.get('Set-Cookie').split(';')[0];sql.exec("UPDATE records SET value=json_set(value,'$.expires',0) WHERE id LIKE 'pin-session:%'");assert.equal((await call('/api/catalog',undefined,c)).status,401);
+ for(let i=0;i<8;i++)assert.equal((await call('/api/login',{pin:'0000'},'','limited')).status,401);const blocked=await call('/api/login',{pin:'2468'},'','limited');assert.equal(blocked.status,429);assert(Number(blocked.headers.get('Retry-After'))>0);
+});
+test('Catalog and progress: scoring, due dates, lost-response replay and conflicting replay',async()=>{const {call,cookie,sql}=await fixture();const c=await(await call('/api/catalog',undefined,cookie)).json();assert.equal(c.drinks.length,39);
+ const attemptId=crypto.randomUUID(),body={id:'mai-tai',correct:true,attemptId};let r=await call('/api/answer',body,cookie);assert.equal(r.status,200);const first=await r.json();assert.equal(first.attempts,1);assert.equal(first.correct,1);assert(first.due>Date.now()+1.99*86400000);
+ assert.deepEqual(await(await call('/api/answer',body,cookie)).json(),first);assert.equal((await call('/api/answer',{...body,correct:false},cookie)).status,409);assert.equal(sql.prepare('SELECT attempts FROM progress WHERE id=?').get('mai-tai').attempts,1);
+ for(let i=2;i<=6;i++){const ans=await(await call('/api/answer',{id:'mai-tai',correct:true,attemptId:crypto.randomUUID()},cookie)).json();assert.equal(ans.correct,i);assert(ans.due<=Date.now()+30*86400000+50);}
+ const bad=await(await call('/api/answer',{id:'mai-tai',correct:false},cookie)).json();assert.equal(bad.correct,0);assert(bad.due>Date.now()+590000);assert.equal((await call('/api/answer',{id:'unknown',correct:true},cookie)).status,400);
+});
+test('Uploads, draft edits, merge/replace, validation and unchanged-data preservation',async()=>{const {call,cookie,files,sql}=await fixture();await call('/api/catalog',undefined,cookie);
+ await call('/api/answer',{id:'mai-tai',correct:true},cookie);await call('/api/answer',{id:'wabi',correct:true},cookie);
+ const d={id:'new-drink',name:'  New Drink  ',category:'house',ingredients:[' Lemon ','lemon','Verjus'],description:{en:' A new drink. ',de:' Ein neuer Drink. '}};
+ const form=new FormData();form.append('file',new File(['Original file'],'menu.TXT',{type:'text/plain'}));form.append('drinks',JSON.stringify([d]));const upload=await call('/api/draft',form,cookie);assert.equal(upload.status,200);assert.equal(files.size,1);assert.equal((await upload.json()).drinks[0].name,'New Drink');
+ let r=await call('/api/publish',{drinks:[d],replace:false},cookie);assert.equal(r.status,200);assert.equal((await r.json()).drinks.length,40);assert.equal(sql.prepare('SELECT COUNT(*) AS n FROM progress').get().n,2);
+ const changed={...drinks[0],description:{...drinks[0].description,en:'Updated description.'}};assert.equal((await call('/api/publish',{drinks:[changed]},cookie)).status,200);assert.equal(sql.prepare('SELECT COUNT(*) AS n FROM progress WHERE id=?').get('mai-tai').n,0);assert.equal(sql.prepare('SELECT COUNT(*) AS n FROM progress WHERE id=?').get('wabi').n,1);
+ for(const broken of [{...d,id:''},{...d,description:{en:'',de:'ok'}},{...d,ingredients:[' ']},{...d,wine:{type:'bogus',sweetness:'dry'}}])assert.equal((await call('/api/publish',{drinks:[broken]},cookie)).status,400);
+ assert.equal((await call('/api/publish',{drinks:[{...drinks[0],name:drinks[1].name}]},cookie)).status,400);
+ const duplicate=[d,{...d,id:'another-id',name:'new drink'}];assert.equal((await call('/api/publish',{drinks:duplicate},cookie)).status,400);
+ assert.equal((await call('/api/publish',{drinks:[d],replace:true},cookie)).status,200);assert.equal(sql.prepare('SELECT COUNT(*) AS n FROM progress').get().n,0);const after=await(await call('/api/catalog',undefined,cookie)).json();assert.equal(after.drinks.length,1);assert.equal(after.draft,null);
+});
+test('Recommendation profiles, seven food groups and invalid inputs',async()=>{const {call,cookie,sql}=await fixture();const training={flavors:['refreshing','citrusy'],foods:['fish','meat','seafood','desserts','fatty_meat','lean_meat','soups'],flavorConfirmed:true,foodConfirmed:true,pitch:{en:'For your meal.',de:'Zu deinem Essen.'}};
+ assert.equal((await call('/api/training',{id:'mai-tai',training},cookie)).status,200);const c=await(await call('/api/catalog',undefined,cookie)).json();assert.deepEqual(c.drinks.find(d=>d.id==='mai-tai').training.foods,training.foods);await call('/api/answer',{id:'mai-tai',correct:true},cookie);const repeated=await call('/api/training',{id:'mai-tai',training},cookie);assert.equal((await repeated.json()).changed,false);assert.equal(sql.prepare('SELECT correct FROM progress WHERE id=?').get('mai-tai').correct,1);
+ assert.equal((await call('/api/training',{id:'mai-tai',training:{...training,foods:['unknown']}},cookie)).status,400);assert.equal((await call('/api/training',null,cookie)).status,400);assert.equal((await call('/api/publish',null,cookie)).status,400);
+});

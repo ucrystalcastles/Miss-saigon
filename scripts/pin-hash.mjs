@@ -1,0 +1,2 @@
+import {pinHash} from '../src/pin-auth.js';import {readSecret} from './secrets.mjs';
+const pin=await readSecret('Four-digit PIN (hidden): ');if(!/^\d{4}$/.test(pin))throw Error('Use four digits.');const salt=Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString('hex');console.log('Optional PROTOTYPE_PIN_HASH value (keep private):');console.log(JSON.stringify({salt,hash:await pinHash(pin,salt)}));
